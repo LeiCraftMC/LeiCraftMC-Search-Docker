@@ -1,0 +1,31 @@
+version: "3.7"
+
+services:
+
+  searxng:
+    container_name: searxng-main
+    image: ghcr.io/leicraftmc/leicraftmc-search:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - /opt/searxng/conf:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=https://search.example.com/
+      - UWSGI_WORKERS=4
+      - UWSGI_THREADS=4
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1m"
+        max-file: "1"
+
+networks:
+  default:
+    driver: bridge
