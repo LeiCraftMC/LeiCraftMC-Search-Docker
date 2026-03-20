@@ -761,7 +761,7 @@ AI_CLIENT_JS = '''
         conversation.turns.push({ role: 'user', content: val, ts: Date.now() });
         updateState();
 
-        const currentText = conversation.turns.slice(0, -1).slice(-6).map(t => (t.role === 'user' ? 'Q' : 'A') + ': ' + t.content).join('\n\n');
+        const currentText = conversation.turns.slice(0, -1).slice(-6).map(t => (t.role === 'user' ? 'Q' : 'A') + ': ' + t.content).join('\\n\\n');
         input.value = '';
         input.blur();
         if (footer) footer.style.display = 'none';
@@ -1410,7 +1410,7 @@ class SXNGPlugin(Plugin):
                     </style>
                     <p id="sxng-stream-data" style="white-space: pre-wrap; color: var(--color-result-description); font-size: 0.95rem; margin:0;"><span class="sxng-cursor"></span></p>
                     {interactive_html}
-                    <script src="/ai-answers-client.js"></script>
+                    <script src="/ai-answers-client.js?v={ts}"></script>
                 </article>
             '''
             search.result_container.answers.add(results.types.Answer(answer=Markup(html_payload)))
