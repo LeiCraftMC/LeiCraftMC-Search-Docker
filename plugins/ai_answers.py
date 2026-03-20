@@ -9,7 +9,7 @@ from flask import Response, request, abort, jsonify
 from searx.plugins import Plugin, PluginInfo
 from searx.result_types import EngineResults
 from flask_babel import gettext
-from markupsafe import Markup
+from markupsafe import Markup, escape
 
 logger = logging.getLogger(__name__)
 
@@ -419,6 +419,424 @@ INTERACTIVE_JS = '''
                         };
 '''
 
+AI_CLIENT_JS = '''
+(async () => {
+    const scriptEl = document.currentScript;
+    const box = scriptEl ? scriptEl.closest('article.answer') : null;
+    if (!box || box.dataset.sxngAiInit === '1') return;
+    box.dataset.sxngAiInit = '1';
+
+    const is_interactive = box.dataset.isInteractive === 'true';
+    const q_init = box.dataset.qInit || '';
+    const lang_init = box.dataset.langInit || 'all';
+    const b64_init = box.dataset.b64Init || '';
+    const tk_init = box.dataset.tkInit || '';
+
+    let urls = [];
+    try {
+        urls = JSON.parse(box.dataset.urls || '[]');
+        if (!Array.isArray(urls)) urls = [];
+    } catch (_) {
+        urls = [];
+    }
+
+    let originalContext = '';
+    try {
+        originalContext = new TextDecoder().decode(Uint8Array.from(atob(b64_init), c => c.charCodeAt(0)));
+    } catch (_) {
+        originalContext = '';
+    }
+
+    const conversation = {
+        originalQuery: q_init,
+        originalContext,
+        originalSources: [...urls],
+        turns: [{ role: 'user', content: q_init, ts: Date.now() }]
+    };
+
+    const data = box.querySelector('#sxng-stream-data');
+    const wrapper = box.closest('.answer');
+    if (!data) return;
+    if (wrapper) wrapper.style.display = 'none';
+    let restored = false;
+    let isStreaming = false;
+
+    function renderCitations(text, links) {
+        const fragment = document.createDocumentFragment();
+        const re = /\[(\d{1,2}(?:\s*,\s*\d{1,2})*)\]/g;
+        let lastIdx = 0;
+        const matches = [...text.matchAll(re)];
+
+        matches.forEach(match => {
+            if (match.index > lastIdx) {
+                const s = document.createElement('span');
+                s.className = 'sxng-chunk';
+                s.textContent = text.substring(lastIdx, match.index);
+                fragment.appendChild(s);
+            }
+            match[1].split(/\s*,\s*/).forEach(n => {
+                const idx = parseInt(n.trim(), 10);
+                if (idx >= 1 && idx <= links.length) {
+                    const url = links[idx - 1];
+                    if (url) {
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.target = '_blank';
+                        a.style.cssText = 'text-decoration:none;color:var(--color-result-link);font-weight:bold;';
+                        a.textContent = `[${n.trim()}]`;
+                        a.className = 'sxng-chunk';
+                        fragment.appendChild(a);
+                    } else {
+                        const s = document.createElement('span');
+                        s.className = 'sxng-chunk';
+                        s.textContent = `[${n.trim()}]`;
+                        fragment.appendChild(s);
+                    }
+                } else {
+                    const s = document.createElement('span');
+                    s.className = 'sxng-chunk';
+                    s.textContent = `[${n.trim()}]`;
+                    fragment.appendChild(s);
+                }
+            });
+            lastIdx = match.index + match[0].length;
+        });
+
+        if (lastIdx < text.length) {
+            const s = document.createElement('span');
+            s.className = 'sxng-chunk';
+            s.textContent = text.substring(lastIdx);
+            fragment.appendChild(s);
+        }
+        return fragment;
+    }
+
+    const footer = box.querySelector('#sxng-footer');
+    const input = box.querySelector('#sxng-action-input');
+
+    if (window.getComputedStyle && box) {
+        try {
+            const docStyles = getComputedStyle(document.documentElement);
+            let accent = docStyles.getPropertyValue('--color-result-link').trim();
+            if (!accent) {
+                const a = document.createElement('a');
+                document.body.appendChild(a);
+                accent = getComputedStyle(a).color;
+                document.body.removeChild(a);
+            }
+            if (accent) {
+                box.style.setProperty('--color-result-link', accent);
+                box.style.setProperty('--sxng-ai-accent', accent);
+            }
+        } catch (_) {}
+    }
+
+    const updateState = () => {
+        try {
+            const state = {
+                t: conversation.turns.map(t => ({ r: t.role === 'user' ? 'u' : 'a', c: t.content.replace(/\s+/g, ' ').trim() })),
+                u: urls
+            };
+            const b64 = btoa(encodeURIComponent(JSON.stringify(state)).replace(/%([0-9A-F]{2})/g, (m, p) => String.fromCharCode('0x' + p)));
+            history.replaceState(null, null, '#ai=' + b64);
+        } catch (_) {}
+    };
+
+    if (location.hash.includes('ai=')) {
+        try {
+            const b64 = location.hash.split('ai=')[1];
+            const json = decodeURIComponent(atob(b64).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
+            const state = JSON.parse(json);
+            if (state.t && state.t.length > 0) {
+                if (state.u && Array.isArray(state.u)) urls = state.u;
+                conversation.turns = state.t.map(t => ({ role: t.r === 'u' ? 'user' : 'assistant', content: t.c.trim(), ts: 0 }));
+                data.innerHTML = '';
+                conversation.turns.forEach(turn => {
+                    if (turn.role === 'user') {
+                        if (turn.content !== conversation.originalQuery) {
+                            const u = document.createElement('span');
+                            u.className = 'sxng-user-msg';
+                            u.textContent = turn.content;
+                            data.appendChild(u);
+                            const clr = document.createElement('div');
+                            clr.style.clear = 'both';
+                            data.appendChild(clr);
+                        }
+                    } else {
+                        data.appendChild(renderCitations(turn.content, urls));
+                    }
+                });
+                box.style.display = 'block';
+                if (wrapper) wrapper.style.display = '';
+                if (footer && is_interactive) footer.style.display = 'flex';
+                restored = true;
+            }
+        } catch (e) {
+            console.warn('Restore failed', e);
+        }
+    }
+
+    const btnCopy = box.querySelector('#btn-copy');
+    if (btnCopy) btnCopy.addEventListener('click', async e => {
+        const btn = e.currentTarget;
+        const originalContent = btn.innerHTML;
+        const text = Array.from(data.childNodes)
+            .filter(n => n.nodeType === 3 || n.tagName === 'SPAN')
+            .map(n => n.textContent)
+            .join('');
+        await navigator.clipboard.writeText(text);
+        btn.innerHTML = '<svg viewBox="0 0 24 24" style="color:#a3be8c;"><path d="M9 16.17L4.83 12L3.41 13.41L9 19L21 7L19.59 5.59L9 16.17Z"/></svg>';
+        setTimeout(() => btn.innerHTML = originalContent, 2000);
+    });
+
+    const synthesizeQuery = (original, followup) => {
+        const cleanOrig = original.replace(/^(what|how|why|when|where|who|which|is|are|can|does|do)(\s+(is|are|do|does|can|to|a|an|the))?\s+/i, '');
+        const origWords = cleanOrig.split(' ').slice(0, 12);
+        return `${origWords.join(' ')} ${followup}`.trim();
+    };
+
+    async function startStream(overrideQ = null, prevAnswer = null, auxContext = null) {
+        if (isStreaming) return;
+        isStreaming = true;
+        try {
+            const ctx = auxContext || conversation.originalContext;
+            if (wrapper) wrapper.style.display = '';
+            box.style.display = 'block';
+
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 60000);
+            const finalQ = overrideQ || q_init;
+
+            const bodyObj = { q: finalQ, lang: lang_init, context: ctx, tk: tk_init, prev_answer: prevAnswer };
+            const res = await fetch('/ai-stream', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(bodyObj),
+                signal: controller.signal
+            });
+
+            clearTimeout(timeoutId);
+            if (!res.ok) {
+                const errSpan = document.createElement('span');
+                errSpan.style.color = '#bf616a';
+                errSpan.textContent = 'Error: ' + res.statusText;
+                data.appendChild(errSpan);
+                return;
+            }
+
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let cursor = data.querySelector('.sxng-cursor');
+            if (!cursor) {
+                cursor = document.createElement('span');
+                cursor.className = 'sxng-cursor';
+                data.appendChild(cursor);
+            }
+
+            let started = false;
+            let lastScrollKick = 0;
+            let collectedResponse = '';
+            let buffer = '';
+
+            const flushBuffer = (force = false) => {
+                if (!buffer) return;
+                if (force) {
+                    const fragment = renderCitations(buffer, urls);
+                    if (cursor) cursor.before(fragment); else data.appendChild(fragment);
+                    buffer = '';
+                    return;
+                }
+                while (true) {
+                    const match = buffer.match(/(\[\d+(?:,\s*\d+)*\])/);
+                    if (!match) break;
+                    const preText = buffer.substring(0, match.index);
+                    if (preText) {
+                        const s = document.createElement('span');
+                        s.className = 'sxng-chunk';
+                        s.textContent = preText;
+                        cursor.before(s);
+                    }
+                    cursor.before(renderCitations(match[0], urls));
+                    buffer = buffer.substring(match.index + match[0].length);
+                }
+                const openIdx = buffer.lastIndexOf('[');
+                if (openIdx === -1) {
+                    if (buffer) {
+                        const s = document.createElement('span');
+                        s.className = 'sxng-chunk';
+                        s.textContent = buffer;
+                        cursor.before(s);
+                        buffer = '';
+                    }
+                } else {
+                    const safeChunk = buffer.substring(0, openIdx);
+                    if (safeChunk) {
+                        const s = document.createElement('span');
+                        s.className = 'sxng-chunk';
+                        s.textContent = safeChunk;
+                        cursor.before(s);
+                    }
+                    buffer = buffer.substring(openIdx);
+                    if (buffer.length > 50) {
+                        const s = document.createElement('span');
+                        s.className = 'sxng-chunk';
+                        s.textContent = buffer[0];
+                        cursor.before(s);
+                        buffer = buffer.substring(1);
+                    }
+                }
+            };
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                const chunk = decoder.decode(value, { stream: true });
+                if (chunk) {
+                    collectedResponse += chunk;
+                    if (!started) {
+                        const trimmed = chunk.replace(/^[\s.,;:!?]+/, '');
+                        if (!trimmed && !collectedResponse.trim()) continue;
+                        if (cursor && !cursor.isConnected) data.appendChild(cursor);
+                        started = true;
+                    }
+                    buffer += chunk;
+                    flushBuffer(false);
+                    const now = Date.now();
+                    if (now - lastScrollKick > 500) {
+                        lastScrollKick = now;
+                        void window.getComputedStyle(data).opacity;
+                    }
+                }
+            }
+
+            flushBuffer(true);
+            if (cursor) cursor.remove();
+
+            let last = data.lastChild;
+            while (last) {
+                if (last.textContent && last.textContent.trim().length === 0) {
+                    const prev = last.previousSibling;
+                    last.remove();
+                    last = prev;
+                } else {
+                    if (last.textContent) last.textContent = last.textContent.trimEnd();
+                    break;
+                }
+            }
+
+            if (!started) {
+                const cursorMissing = data.querySelector('.sxng-cursor');
+                if (cursorMissing) cursorMissing.remove();
+                const errSpan = document.createElement('span');
+                errSpan.style.color = '#bf616a';
+                errSpan.textContent = 'No response received. Check API configuration.';
+                data.appendChild(errSpan);
+                return;
+            }
+
+            if (footer && is_interactive) footer.style.display = 'flex';
+            if (collectedResponse) {
+                conversation.turns.push({ role: 'assistant', content: collectedResponse.trim(), ts: Date.now() });
+            }
+        } catch (e) {
+            console.error(e);
+            if (box.parentElement) box.parentElement.remove();
+            else box.remove();
+        } finally {
+            isStreaming = false;
+        }
+    }
+
+    const btnRegen = box.querySelector('#btn-regen');
+    if (btnRegen) btnRegen.addEventListener('click', () => {
+        data.innerHTML = '<span class="sxng-cursor"></span>';
+        if (footer) footer.style.display = 'none';
+        startStream();
+    });
+
+    const handleAction = async e => {
+        if (e) e.preventDefault();
+        if (!input) return;
+        const val = input.value.trim();
+        conversation.turns.push({ role: 'user', content: val, ts: Date.now() });
+        updateState();
+
+        const currentText = conversation.turns.slice(0, -1).slice(-6).map(t => (t.role === 'user' ? 'Q' : 'A') + ': ' + t.content).join('\n\n');
+        input.value = '';
+        input.blur();
+        if (footer) footer.style.display = 'none';
+
+        if (val) {
+            const cursor = data.querySelector('.sxng-cursor');
+            if (cursor) cursor.remove();
+            const userMsg = document.createElement('span');
+            userMsg.className = 'sxng-user-msg';
+            userMsg.textContent = val;
+            data.appendChild(userMsg);
+            const clr = document.createElement('div');
+            clr.style.clear = 'both';
+            data.appendChild(clr);
+
+            const newCursor = document.createElement('span');
+            newCursor.className = 'sxng-cursor';
+            data.appendChild(newCursor);
+
+            const synthesized = synthesizeQuery(q_init, val);
+            let auxContext = null;
+            try {
+                const auxData = await fetch('/ai-auxiliary-search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query: synthesized, lang: lang_init, offset: urls.length })
+                }).then(r => r.json());
+                if (auxData.context) {
+                    const originalBackground = conversation.originalContext.substring(0, 1500);
+                    auxContext = `FRESH SOURCES (most relevant):\n${auxData.context}\n\nBACKGROUND (for reference):\n${originalBackground}`;
+                    if (auxData.new_urls && Array.isArray(auxData.new_urls)) urls = urls.concat(auxData.new_urls);
+                }
+            } catch (_) {}
+
+            await startStream(val, currentText, auxContext);
+            updateState();
+        } else {
+            const cursor = data.querySelector('.sxng-cursor');
+            if (cursor) cursor.remove();
+            data.appendChild(document.createElement('br'));
+            data.appendChild(document.createElement('br'));
+            const newCursor = document.createElement('span');
+            newCursor.className = 'sxng-cursor';
+            data.appendChild(newCursor);
+            await startStream('Continue', currentText);
+            updateState();
+        }
+    };
+
+    const actionForm = box.querySelector('#sxng-action-form');
+    if (actionForm) actionForm.addEventListener('submit', handleAction);
+    if (input) {
+        input.addEventListener('focus', () => {
+            setTimeout(() => input.scrollIntoView({ behavior: 'smooth', block: 'center' }), 300);
+        });
+    }
+
+    const _origStream = startStream;
+    startStream = async function (...args) {
+        if (args.length === 0 && restored) return;
+        await _origStream.apply(this, args);
+        if (args.length === 0) updateState();
+    };
+
+    fetch('/ai-stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ warmup: true }),
+        keepalive: true
+    }).catch(() => {});
+
+    if (!restored) startStream();
+})();
+'''
+
 
 import typing
 if typing.TYPE_CHECKING:
@@ -518,24 +936,30 @@ class SXNGPlugin(Plugin):
         else:
              self.secret = os.getenv('SXNG_LLM_SECRET', '')
 
+    @staticmethod
+    def _obj_get(obj, key, default=None):
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
     def _parse_aux_results(self, raw_results, raw_infoboxes, raw_answers):
         results = []
         limit = self.context_deep_count + self.context_shallow_count
         for r in raw_results[:limit]:
             results.append({
-                'title': r.get('title', ''),
-                'content': r.get('content', ''),
-                'url': r.get('url', ''),
-                'publishedDate': r.get('publishedDate', '')
+                'title': self._obj_get(r, 'title', ''),
+                'content': self._obj_get(r, 'content', ''),
+                'url': self._obj_get(r, 'url', ''),
+                'publishedDate': self._obj_get(r, 'publishedDate', '')
             })
         
         # SearXNG already merges infoboxes by ID - take first with full content
         infoboxes = []
         for ib in raw_infoboxes[:1]:
             infoboxes.append({
-                'name': ib.get('infobox', '') or ib.get('title', ''),
-                'content': ib.get('content', '')[:2000],
-                'attributes': ib.get('attributes', [])
+                'name': self._obj_get(ib, 'infobox', '') or self._obj_get(ib, 'title', ''),
+                'content': str(self._obj_get(ib, 'content', ''))[:2000],
+                'attributes': self._obj_get(ib, 'attributes', [])
             })
             
         # Only extract simple Answer types (skip Translations, WeatherAnswer etc.)
@@ -553,6 +977,12 @@ class SXNGPlugin(Plugin):
     def init(self, app):
         if not self.provider:
             return
+
+        @app.route('/ai-answers-client.js', methods=['GET'])
+        def ai_answers_client_js():
+            return Response(AI_CLIENT_JS, mimetype='application/javascript', headers={
+                'Cache-Control': 'public, max-age=300'
+            })
 
         @app.route('/ai-auxiliary-search', methods=['POST'])
         def ai_auxiliary_search():
@@ -840,16 +1270,16 @@ class SXNGPlugin(Plugin):
         # Knowledge graph
         knowledge_graph_lines = []
         for ib in infoboxes:
-            ib_name = ib.get('name', '') or ib.get('infobox', '') or ib.get('title', '')
-            ib_content = str(ib.get('content', '')).replace('\n', ' ').strip()
+            ib_name = self._obj_get(ib, 'name', '') or self._obj_get(ib, 'infobox', '') or self._obj_get(ib, 'title', '')
+            ib_content = str(self._obj_get(ib, 'content', '')).replace('\n', ' ').strip()
             
             if ib_name:
                 parts = [f"INFOBOX [{ib_name}]:"]
                 if ib_content:
                     parts.append(ib_content)
-                for attr in ib.get('attributes', []):
-                    attr_label = attr.get('label', '')
-                    attr_value = attr.get('value', '')
+                for attr in self._obj_get(ib, 'attributes', []):
+                    attr_label = self._obj_get(attr, 'label', '')
+                    attr_value = self._obj_get(attr, 'value', '')
                     if attr_label and attr_value:
                         parts.append(f"  {attr_label}: {attr_value}")
                 
@@ -865,13 +1295,13 @@ class SXNGPlugin(Plugin):
         # Deep sources: full content
         deep_lines = []
         for i, r in enumerate(raw_results[:self.context_deep_count]):
-            url = r.get('url', '')
+            url = self._obj_get(r, 'url', '')
             result_urls.append(url)
             domain = urlparse(url).netloc.replace('www.', '')
-            date = r.get('publishedDate')
+            date = self._obj_get(r, 'publishedDate')
             date_str = f" ({date})" if date else ""
-            title = (r.get('title') or "").replace('\n', ' ').strip()
-            content = str(r.get('content', '')).replace('\n', ' ').strip()[:800]
+            title = (self._obj_get(r, 'title') or "").replace('\n', ' ').strip()
+            content = str(self._obj_get(r, 'content', '')).replace('\n', ' ').strip()[:800]
             idx = i + 1 + offset
             deep_lines.append(f"[{idx}] {domain}{date_str}: {title}: {content}")
         
@@ -884,10 +1314,10 @@ class SXNGPlugin(Plugin):
             start_idx = self.context_deep_count
             end_idx = self.context_deep_count + self.context_shallow_count
             for i, r in enumerate(raw_results[start_idx:end_idx]):
-                url = r.get('url', '')
+                url = self._obj_get(r, 'url', '')
                 result_urls.append(url)
                 domain = urlparse(url).netloc.replace('www.', '')
-                title = (r.get('title') or '').replace('\n', ' ').strip()[:60]
+                title = (self._obj_get(r, 'title') or '').replace('\n', ' ').strip()[:60]
                 idx = i + 1 + start_idx + offset
                 shallow_lines.append(f"[{idx}] {domain}: {title}")
             
@@ -924,24 +1354,26 @@ class SXNGPlugin(Plugin):
             tk = f"{ts}.{sig}"
             
             b64_context = base64.b64encode(context_str.encode('utf-8')).decode('utf-8')
-            js_q = json.dumps(q_clean)
-            js_lang = json.dumps(lang)
             total_context_count = self.context_deep_count + self.context_shallow_count
-            js_urls = json.dumps([r.get('url') for r in raw_results[:total_context_count]])
+            js_urls = json.dumps([self._obj_get(r, 'url') for r in raw_results[:total_context_count]])
 
             is_interactive = self.interactive
             
             interactive_css = INTERACTIVE_CSS if is_interactive else ''
             interactive_html = INTERACTIVE_HTML if is_interactive else ''
-            interactive_js_init = INTERACTIVE_JS if is_interactive else ''
-
-            interactive_js_complete = "footer.style.display = 'flex';" if is_interactive else ''
-            stream_fn_sig = 'async function startStream(overrideQ = null, prevAnswer = null, auxContext = null)'
-            stream_q = 'overrideQ || q_init' if is_interactive else 'q_init'
-            stream_body = f'''prev_answer: prevAnswer''' if is_interactive else ''
 
             html_payload = f'''
-                <article id="sxng-stream-box" class="answer" style="display:none; margin: 1rem 0;">
+                <article
+                    id="sxng-stream-box"
+                    class="answer"
+                    style="display:none; margin: 1rem 0;"
+                    data-is-interactive="{'true' if is_interactive else 'false'}"
+                    data-q-init="{escape(q_clean)}"
+                    data-lang-init="{escape(lang)}"
+                    data-urls="{escape(js_urls)}"
+                    data-b64-init="{b64_context}"
+                    data-tk-init="{tk}"
+                >
                     <style>
                         @keyframes sxng-fade-pulse {{
                             0%, 100% {{ opacity: 0.1; }}
@@ -978,229 +1410,7 @@ class SXNGPlugin(Plugin):
                     </style>
                     <p id="sxng-stream-data" style="white-space: pre-wrap; color: var(--color-result-description); font-size: 0.95rem; margin:0;"><span class="sxng-cursor"></span></p>
                     {interactive_html}
-                    <script>
-                    (async () => {{
-                        const is_interactive = {'true' if is_interactive else 'false'};
-                        const q_init = {js_q};
-                        const lang_init = {js_lang};
-                        let urls = {js_urls};
-                        const b64_init = "{b64_context}";
-                        const tk_init = "{tk}";
-                        const conversation = {{
-                            originalQuery: q_init,
-                            originalContext: new TextDecoder().decode(Uint8Array.from(atob(b64_init), c => c.charCodeAt(0))),
-                            originalSources: [...urls],
-                            turns: [{{role: 'user', content: q_init, ts: Date.now()}}]
-                        }};
-                        const box = document.getElementById('sxng-stream-box');
-                        const data = document.getElementById('sxng-stream-data');
-                        const wrapper = box.closest('.answer');
-                        if (wrapper) wrapper.style.display = 'none';
-                        let restored = false;
-                        let isStreaming = false;
-                        
-                        {CITATION_HELPER_JS}
-
-                        {interactive_js_init}
-                        function synthesizeQuery(original, followup) {{
-                            // combine with original for context, stripping generic question starters
-                            const cleanOrig = original.replace(/^(what|how|why|when|where|who|which|is|are|can|does|do)(\s+(is|are|do|does|can|to|a|an|the))?\s+/i, '');
-                            const origWords = cleanOrig.split(' ').slice(0, 12);
-                            return `${{origWords.join(' ')}} ${{followup}}`.trim();
-                        }}
-
-
-
-                        {stream_fn_sig} {{
-                            if (isStreaming) {{
-                                console.warn('[AI Answers] Stream already in progress, ignoring duplicate call');
-                                return;
-                            }}
-                            
-                            isStreaming = true;
-                            try {{
-                                const ctx = auxContext || conversation.originalContext;
-                                if (wrapper) wrapper.style.display = '';
-                                box.style.display = 'block';
-
-                                const controller = new AbortController();
-                                const timeoutId = setTimeout(() => controller.abort(), 60000);
-                                const finalQ = {stream_q};
-                                
-                                const bodyObj = {{ q: finalQ, lang: lang_init, context: ctx, tk: tk_init{', ' + stream_body if stream_body else ''} }};
-                                const res = await fetch('/ai-stream', {{
-                                    method: 'POST',
-                                    headers: {{ 'Content-Type': 'application/json' }},
-                                    body: JSON.stringify(bodyObj),
-                                    signal: controller.signal
-                                }});
-
-                                clearTimeout(timeoutId);
-                                if (!res.ok) {{
-                                    const errSpan = document.createElement('span');
-                                    errSpan.style.color = '#bf616a';
-                                    errSpan.textContent = "Error: " + res.statusText;
-                                    data.appendChild(errSpan);
-                                    return;
-                                }}
-
-                                const reader = res.body.getReader();
-                                const decoder = new TextDecoder();
-                                let cursor = data.querySelector('.sxng-cursor');
-                                if (!cursor) {{
-                                    cursor = document.createElement('span');
-                                    cursor.className = 'sxng-cursor';
-                                    data.appendChild(cursor);
-                                }}
-
-                                let started = false;
-                                let pendingSpace = '';
-                                let lastScrollKick = 0;
-                                let collectedResponse = '';
-
-                                let buffer = '';
-                                const flushBuffer = (force = false) => {{
-                                    if (!buffer) return;
-                                    
-                                    if (force) {{
-                                        const fragment = renderCitations(buffer, urls);
-                                        if (cursor) cursor.before(fragment);
-                                        else data.appendChild(fragment);
-                                        buffer = '';
-                                        return;
-                                    }}
-
-                                    while (true) {{
-                                        const match = buffer.match(/(\\[\\d+(?:,\\s*\\d+)*\\])/);
-                                        
-                                        if (!match) break;
-                                        
-                                        const preText = buffer.substring(0, match.index);
-                                        if (preText) {{
-                                            const s = document.createElement('span');
-                                            s.className = 'sxng-chunk';
-                                            s.textContent = preText;
-                                            cursor.before(s);
-                                        }}
-
-                                        const citationText = match[0];
-                                        const fragment = renderCitations(citationText, urls);
-                                        cursor.before(fragment);
-
-                                        buffer = buffer.substring(match.index + match[0].length);
-                                    }}
-
-                                    const openIdx = buffer.lastIndexOf('[');
-                                    if (openIdx === -1) {{
-                                        if (buffer) {{
-                                            const s = document.createElement('span');
-                                            s.className = 'sxng-chunk';
-                                            s.textContent = buffer;
-                                            cursor.before(s);
-                                            buffer = '';
-                                        }}
-                                    }} else {{
-                                        const safeChunk = buffer.substring(0, openIdx);
-                                        if (safeChunk) {{
-                                            const s = document.createElement('span');
-                                            s.className = 'sxng-chunk';
-                                            s.textContent = safeChunk;
-                                            cursor.before(s);
-                                        }}
-                                        buffer = buffer.substring(openIdx);
-                                        
-                                        if (buffer.length > 50) {{
-                                            const s = document.createElement('span');
-                                            s.className = 'sxng-chunk';
-                                            s.textContent = buffer[0];
-                                            cursor.before(s);
-                                            buffer = buffer.substring(1);
-                                        }}
-                                    }}
-                                }};
-
-                                while (true) {{
-                                    const {{done, value}} = await reader.read();
-                                    if (done) break;
-
-                                    const chunk = decoder.decode(value, {{stream: true}});
-                                    if (chunk) {{
-                                        collectedResponse += chunk;
-                                        
-                                        // Initial scroll/focus logic (only once)
-                                        if (!started) {{
-                                            const trimmed = chunk.replace(/^[\\s.,;:!?]+/, '');
-                                            if (!trimmed && !collectedResponse.trim()) continue; // Skip leading garbage
-                                            if (cursor && !cursor.isConnected) data.appendChild(cursor);
-                                            started = true;
-                                        }}
-
-                                        buffer += chunk;
-                                        flushBuffer(false);
-
-                                        const now = Date.now();  // Periodic repaint for mobile
-                                        if (now - lastScrollKick > 500) {{
-                                            lastScrollKick = now;
-                                            void window.getComputedStyle(data).opacity;
-                                        }}
-                                    }}
-                                }}
-                                
-                                // Final flush of any partial text (e.g. unclosed brackets)
-                                flushBuffer(true);
-                                
-                                if (cursor) cursor.remove();
-
-                                // Cleanup trailing newlines
-                                let last = data.lastChild;
-                                while (last) {{
-                                    if (last.textContent && last.textContent.trim().length === 0) {{
-                                        const prev = last.previousSibling;
-                                        last.remove();
-                                        last = prev;
-                                    }} else {{
-                                        if (last.textContent) last.textContent = last.textContent.trimEnd();
-                                        break;
-                                    }}
-                                }}
-
-                                if (!started) {{
-                                    const cursor = data.querySelector('.sxng-cursor');
-                                    if (cursor) cursor.remove();
-                                    const errSpan = document.createElement('span');
-                                    errSpan.style.color = '#bf616a';
-                                    errSpan.textContent = 'No response received. Check API configuration.';
-                                    data.appendChild(errSpan);
-                                    return;
-                                }}
-
-                                {interactive_js_complete}
-
-                                if (collectedResponse) {{
-                                    conversation.turns.push({{role: 'assistant', content: collectedResponse.trim(), ts: Date.now()}});
-                                }}
-
-                            }} catch (e) {{
-                                console.error(e);
-                                if (box.parentElement) box.parentElement.remove();
-                                else box.remove();
-                            }} finally {{
-                                // Always release lock, even on error
-                                isStreaming = false;
-                            }}
-                        }}
-
-                        // Warmup handshake
-                        fetch('/ai-stream', {{
-                            method: 'POST',
-                            headers: {{'Content-Type': 'application/json'}},
-                            body: JSON.stringify({{warmup: true}}),
-                            keepalive: true
-                        }}).catch(() => {{}});
-
-                        if (!restored) startStream();
-                    }})();
-                    </script>
+                    <script src="/ai-answers-client.js"></script>
                 </article>
             '''
             search.result_container.answers.add(results.types.Answer(answer=Markup(html_payload)))
